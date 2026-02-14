@@ -3,10 +3,12 @@
 // Removes the premium gate from the Screen Share Settings modal so that all
 // resolution / frame-rate options are selectable regardless of subscription status.
 //
+// Uses both webpack-level patching (via Fluxin API) and CSS fallback.
+//
 // Install via Fluxin Plugins UI by hosting this file somewhere reachable over HTTP(S).
 // Example local-dev server is provided in ./server.js
 
-(function () {
+(function (fluxin) {
   "use strict";
 
   const PLUGIN_ID = "fluxin-auto-4k60-unlock";
@@ -16,21 +18,17 @@
   }
 
   // ---------------------------------------------------------------------------
-  // CSS injection — hide lock icons & premium banner without touching the DOM
-  // tree, which would break React reconciliation and unmount the modal.
+  // 1. CSS overrides — instant visual unlock (no DOM mutation = no React crash)
   // ---------------------------------------------------------------------------
 
   const style = document.createElement("style");
   style.id = PLUGIN_ID + "-styles";
   style.textContent = `
     /* Hide crown/lock icons inside option buttons */
-    button[class*="optionButton"] svg { display: none !important; }
+    button[class*="optionButton"] svg[class*="lock"],
+    button[class*="optionButton"] svg[class*="Lock"] { display: none !important; }
 
-    /* Make locked buttons look/behave like normal unlocked ones:
-       Fluxer uses CSS-module hashed class names, but the substring
-       "Locked" is always present in the source class name, so the
-       generated hash still contains it. We target any class containing
-       "Locked" and override the visual cues. */
+    /* Make locked buttons look/behave like normal unlocked ones */
     button[class*="Locked"] {
       opacity: 1 !important;
       pointer-events: auto !important;
@@ -44,256 +42,271 @@
   log("Injected unlock CSS");
 
   // ---------------------------------------------------------------------------
-  // Utility helpers
+  // 2. Webpack-level patching via Fluxin API
+  //
+  //    The Fluxin web preload hooks webpack chunk loading and exposes
+  //    `fluxin.patches.register()` which does regex find-and-replace on
+  //    module source code BEFORE it executes.
+  //
+  //    We also do runtime patching for modules that already loaded.
   // ---------------------------------------------------------------------------
 
-  function textOf(el) {
-    return (el && typeof el.textContent === "string" ? el.textContent : "").trim();
-  }
+  // --- 2a. Patch VoiceSettingsStore: make hasPremium always true for our checks
+  //
+  //    sanitizePremiumSettings() and validateSettings() both guard on
+  //    `this.hasPremium`.  We patch the store singleton at runtime.
 
-  // ---------------------------------------------------------------------------
-  // React fiber helpers
-  // ---------------------------------------------------------------------------
+  let storePatchApplied = false;
 
-  function getReactFiberKey(domNode) {
-    return Object.keys(domNode).find((k) => k.startsWith("__reactFiber$"));
-  }
+  function patchStoreRuntime() {
+    if (storePatchApplied) return;
+    if (!fluxin) return;
 
-  function findFiber(domNode, predicate, maxDepth = 30) {
-    const key = getReactFiberKey(domNode);
-    if (!key) return null;
+    // Search every loaded webpack module for the VoiceSettingsStore singleton
+    const modules = fluxin.getWebpackModules ? fluxin.getWebpackModules() : fluxin.webpackModules;
+    if (!modules) return;
 
-    let fiber = domNode[key];
-    for (let i = 0; i < maxDepth && fiber; i++) {
-      try {
-        if (predicate(fiber)) return fiber;
-      } catch (_) {
-        /* ignore */
+    for (const [, mod] of modules) {
+      if (!mod.exports) continue;
+      const exp = mod.exports.default || mod.exports;
+      if (
+        exp &&
+        typeof exp === "object" &&
+        "screenshareResolution" in exp &&
+        "hasPremium" in exp &&
+        "videoFrameRate" in exp
+      ) {
+        exp.hasPremium = true;
+        storePatchApplied = true;
+        log("Patched VoiceSettingsStore.hasPremium = true (runtime)");
+        return;
       }
+    }
+  }
+
+  // The modules might not be populated yet if the plugin loads early.
+  // Retry a few times.
+  function patchStoreWithRetry(attempts = 20, interval = 500) {
+    if (storePatchApplied) return;
+    patchStoreRuntime();
+    if (storePatchApplied) return;
+    if (attempts <= 0) {
+      log("Could not find VoiceSettingsStore in webpack modules — store-level bypass unavailable");
+      return;
+    }
+    setTimeout(() => patchStoreWithRetry(attempts - 1, interval), interval);
+  }
+
+  patchStoreWithRetry();
+
+  // --- 2b. Patch the modal utilities module: set isPremium to false on options
+  //         and remove the premium-modal-open guard in click handlers.
+  //
+  //    These are webpack source patches that apply to modules before execution.
+  //    They only work for modules that haven't loaded yet (or on reload).
+
+  if (fluxin && fluxin.patches && fluxin.patches.register) {
+    // Patch RESOLUTION_OPTIONS / FRAMERATE_OPTIONS: isPremium: true → false
+    fluxin.patches.register({
+      id: PLUGIN_ID + "-options-res",
+      type: "replace",
+      match: "isPremium:\\s*true",
+      replacement: "isPremium: false",
+      predicate: "RESOLUTION_OPTIONS|FRAMERATE_OPTIONS",
+    });
+
+    // Patch handleResolutionClick / handleFrameRateClick: remove premium modal guard
+    // Original: if (isPremium && !hasPremium) { PremiumModalActionCreators.open(); return; }
+    fluxin.patches.register({
+      id: PLUGIN_ID + "-click-guard",
+      type: "replace",
+      match: "if\\s*\\(isPremium\\s*&&\\s*!hasPremium\\)\\s*\\{[^}]*PremiumModalActionCreators[^}]*\\}",
+      replacement: "/* premium check removed by fluxin-auto-4k60-unlock */",
+      predicate: "handleResolutionClick|handleFrameRateClick",
+    });
+
+    // Patch initial state: don't clamp to 'medium'/30 for non-premium
+    // Original: !hasPremium && (voiceSettings.screenshareResolution === 'high' || ...)
+    fluxin.patches.register({
+      id: PLUGIN_ID + "-initial-state",
+      type: "replace",
+      match: "!hasPremium\\s*&&[\\s\\S]*?\\?\\s*['\"]medium['\"]\\s*:\\s*voiceSettings\\.screenshareResolution",
+      replacement: "false ? 'medium' : voiceSettings.screenshareResolution",
+      predicate: "screenshareResolution",
+    });
+
+    fluxin.patches.register({
+      id: PLUGIN_ID + "-initial-fps",
+      type: "replace",
+      match: "!hasPremium\\s*&&\\s*voiceSettings\\.videoFrameRate\\s*>\\s*30\\s*\\?\\s*30\\s*:",
+      replacement: "false ?  30 :",
+      predicate: "videoFrameRate",
+    });
+
+    // Patch VoiceSettingsStore validateSettings: remove premium clamping
+    fluxin.patches.register({
+      id: PLUGIN_ID + "-validate-clamp",
+      type: "replace",
+      match: "if\\s*\\(!this\\.hasPremium\\)\\s*\\{",
+      replacement: "if (false) {",
+      predicate: "validateSettings|sanitizePremiumSettings",
+    });
+
+    // Patch sanitizePremiumSettings: make it a no-op
+    fluxin.patches.register({
+      id: PLUGIN_ID + "-sanitize-noop",
+      type: "replace",
+      match: "sanitizePremiumSettings\\(\\)\\s*\\{",
+      replacement: "sanitizePremiumSettings() { return;",
+      predicate: "sanitizePremiumSettings",
+    });
+
+    // Patch the modal: option.isPremium && !hasPremium → always false
+    fluxin.patches.register({
+      id: PLUGIN_ID + "-modal-lock",
+      type: "replace",
+      match: "option\\.isPremium\\s*&&\\s*!hasPremium",
+      replacement: "false",
+      predicate: "optionButton|ScreenShareSettings",
+    });
+
+    log("Registered webpack patches via Fluxin API");
+  } else {
+    log("Fluxin patches API not available — webpack patches skipped");
+  }
+
+  // ---------------------------------------------------------------------------
+  // 3. DOM-level click interception (fallback for already-loaded modules)
+  //
+  //    If the webpack patches didn't apply (modules already loaded), we use
+  //    a capturing click listener on the document to intercept premium button
+  //    clicks and dispatch React state changes directly.
+  // ---------------------------------------------------------------------------
+
+  function getReactFiberKey(el) {
+    return Object.keys(el).find((k) => k.startsWith("__reactFiber$"));
+  }
+
+  function isOptionButton(el) {
+    if (el.tagName !== "BUTTON") return false;
+    const text = (el.textContent || "").trim();
+    return /^(480p|720p|1080p|1440p|4K|\d+\s*fps)$/.test(text);
+  }
+
+  function isInsideScreenShareModal(el) {
+    let node = el;
+    while (node) {
+      if (node.textContent && node.textContent.includes("Screen Share Settings")) {
+        return true;
+      }
+      // Don't walk too far up
+      if (node === document.body) break;
+      node = node.parentElement;
+    }
+    return false;
+  }
+
+  function dispatchStateChange(btn) {
+    const text = (btn.textContent || "").trim();
+    const resMatch = text.match(/^(480p|720p|1080p|1440p|4K)$/);
+    const fpsMatch = text.match(/^(\d+)\s*fps$/);
+    if (!resMatch && !fpsMatch) return false;
+
+    // Walk fiber tree from button to find the component with useState hooks
+    const fiberKey = getReactFiberKey(btn);
+    if (!fiberKey) return false;
+
+    let fiber = btn[fiberKey];
+    for (let depth = 0; depth < 40 && fiber; depth++) {
+      // Count hooks to find the right component
+      let hs = fiber.memoizedState;
+      const dispatchers = [];
+      while (hs) {
+        if (hs.queue && typeof hs.queue.dispatch === "function") {
+          dispatchers.push({ state: hs.memoizedState, dispatch: hs.queue.dispatch });
+        }
+        hs = hs.next;
+      }
+
+      // We need at least 3 useState dispatchers (isSharing, resolution, framerate)
+      if (dispatchers.length >= 3) {
+        if (resMatch) {
+          const map = { "480p": "low", "720p": "medium", "1080p": "high", "1440p": "ultra", "4K": "4k" };
+          const value = map[resMatch[1]];
+          for (const d of dispatchers) {
+            if (typeof d.state === "string" && ["low", "medium", "high", "ultra", "4k"].includes(d.state)) {
+              d.dispatch(value);
+              log(`Set resolution → ${value}`);
+              return true;
+            }
+          }
+        }
+        if (fpsMatch) {
+          const value = parseInt(fpsMatch[1], 10);
+          for (const d of dispatchers) {
+            if (typeof d.state === "number" && [15, 24, 30, 60].includes(d.state)) {
+              d.dispatch(value);
+              log(`Set framerate → ${value}`);
+              return true;
+            }
+          }
+        }
+      }
+
       fiber = fiber.return;
     }
-    return null;
+
+    return false;
   }
 
-  function getReactProps(domNode) {
-    const key = Object.keys(domNode).find((k) => k.startsWith("__reactProps$"));
-    return key ? domNode[key] : null;
-  }
+  // Capturing listener on document — fires BEFORE React's delegated handler.
+  // We only intercept clicks on premium option buttons inside the modal.
+  document.addEventListener(
+    "click",
+    (e) => {
+      // Find the actual button (click might be on inner text/span)
+      let target = e.target;
+      while (target && target.tagName !== "BUTTON" && target !== document.body) {
+        target = target.parentElement;
+      }
+      if (!target || target.tagName !== "BUTTON") return;
+      if (!isOptionButton(target)) return;
+      if (!isInsideScreenShareModal(target)) return;
+
+      const text = (target.textContent || "").trim();
+      const isPremiumOption =
+        text === "1080p" || text === "1440p" || text === "4K" || text === "60 fps";
+
+      if (!isPremiumOption) return;
+
+      // Try to dispatch the state change ourselves
+      const dispatched = dispatchStateChange(target);
+      if (dispatched) {
+        // Prevent React's handler from firing (which would open premium modal)
+        e.stopPropagation();
+      }
+    },
+    true, // capture phase
+  );
+
+  log("Installed click interceptor for premium option buttons");
 
   // ---------------------------------------------------------------------------
-  // Phase 0 — Patch MobX VoiceSettingsStore.hasPremium
+  // 4. Re-patch store when modal opens (in case it reset)
   // ---------------------------------------------------------------------------
 
-  let storePatched = false;
-
-  function tryPatchStore(modalRoot) {
-    if (storePatched) return;
-
-    // Strategy 1: webpack module cache
-    try {
-      const cache = window.__fluxin_webpack_require__
-        ? window.__fluxin_webpack_require__.c
-        : null;
-
-      if (cache) {
-        for (const moduleId of Object.keys(cache)) {
-          const mod = cache[moduleId];
-          if (
-            mod &&
-            mod.exports &&
-            mod.exports.default &&
-            typeof mod.exports.default === "object" &&
-            "screenshareResolution" in mod.exports.default &&
-            "hasPremium" in mod.exports.default
-          ) {
-            mod.exports.default.hasPremium = true;
-            storePatched = true;
-            log("Patched VoiceSettingsStore.hasPremium = true (via webpack cache)");
-            return;
-          }
-        }
-      }
-    } catch (_) {}
-
-    // Strategy 2: walk fibers from modal looking for MobX store on stateNode
-    try {
-      const el = modalRoot.querySelector("button") || modalRoot.querySelector("div") || modalRoot;
-      const fiberKey = getReactFiberKey(el);
-      if (fiberKey) {
-        let fiber = el[fiberKey];
-        for (let i = 0; i < 50 && fiber; i++) {
-          if (fiber.stateNode && typeof fiber.stateNode === "object") {
-            const inst = fiber.stateNode;
-            if ("screenshareResolution" in inst && "hasPremium" in inst) {
-              inst.hasPremium = true;
-              storePatched = true;
-              log("Patched VoiceSettingsStore.hasPremium = true (via fiber stateNode)");
-              return;
-            }
-          }
-          fiber = fiber.return;
-        }
-      }
-    } catch (_) {}
-
-    if (!storePatched) {
-      log("Could not locate VoiceSettingsStore — falling back to handler-bypass only");
+  const observer = new MutationObserver(() => {
+    if (!storePatchApplied) {
+      patchStoreRuntime();
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Phase 1 — Bypass React click handlers for premium option buttons
-  //
-  // Instead of mutating the DOM (which breaks React), we patch the React
-  // internal props onClick to call the state dispatcher directly, skipping
-  // the isPremium && !hasPremium guard that opens the premium modal.
-  // ---------------------------------------------------------------------------
-
-  function bypassClickHandlers(modalRoot) {
-    const optionButtons = modalRoot.querySelectorAll("button");
-
-    for (const btn of optionButtons) {
-      // Skip buttons we already patched
-      if (btn._fluxinPatched) continue;
-
-      const label = textOf(btn);
-
-      const resMatch = label.match(/^(480p|720p|1080p|1440p|4K)$/);
-      const fpsMatch = label.match(/^(\d+)\s*fps$/);
-
-      if (!resMatch && !fpsMatch) continue;
-
-      const reactProps = getReactProps(btn);
-      if (!reactProps || !reactProps.onClick) continue;
-
-      const originalOnClick = reactProps.onClick;
-
-      // Build our replacement handler
-      const patchedOnClick = function (e) {
-        // Find the fiber that owns the useState hooks for resolution/framerate
-        const modalFiber = findFiber(btn, (f) => {
-          let hs = f.memoizedState;
-          let count = 0;
-          while (hs) { count++; hs = hs.next; }
-          return count >= 6;
-        });
-
-        if (modalFiber) {
-          // Collect all useState dispatchers
-          let hs = modalFiber.memoizedState;
-          const dispatchers = [];
-          while (hs) {
-            if (hs.queue && typeof hs.queue.dispatch === "function") {
-              dispatchers.push({ state: hs.memoizedState, dispatch: hs.queue.dispatch });
-            }
-            hs = hs.next;
-          }
-
-          if (resMatch) {
-            const valueMap = { "480p": "low", "720p": "medium", "1080p": "high", "1440p": "ultra", "4K": "4k" };
-            const value = valueMap[resMatch[1]];
-            if (value) {
-              for (const d of dispatchers) {
-                if (typeof d.state === "string" && ["low", "medium", "high", "ultra", "4k"].includes(d.state)) {
-                  d.dispatch(value);
-                  log(`Set resolution → ${value}`);
-                  return;
-                }
-              }
-            }
-          }
-
-          if (fpsMatch) {
-            const value = parseInt(fpsMatch[1], 10);
-            for (const d of dispatchers) {
-              if (typeof d.state === "number" && [15, 24, 30, 60].includes(d.state)) {
-                d.dispatch(value);
-                log(`Set framerate → ${value}`);
-                return;
-              }
-            }
-          }
-        }
-
-        // Fallback: call original (may open premium modal)
-        originalOnClick(e);
-      };
-
-      // Patch React's internal onClick — this is the handler React's
-      // synthetic event system actually calls, so no native listener needed.
-      reactProps.onClick = patchedOnClick;
-      btn._fluxinPatched = true;
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Modal detection & orchestration
-  // ---------------------------------------------------------------------------
-
-  function isScreenShareSettingsModal(node) {
-    if (!node || node.nodeType !== 1) return false;
-    return node.textContent && node.textContent.includes("Screen Share Settings");
-  }
-
-  const processed = new WeakSet();
-
-  function processModal(modalRoot) {
-    if (processed.has(modalRoot)) return;
-    processed.add(modalRoot);
-
-    // Phase 0: patch the MobX store
-    tryPatchStore(modalRoot);
-
-    // Phase 1: bypass React click handlers
-    // Wait a frame for React to finish rendering before we touch the fibers.
-    requestAnimationFrame(() => {
-      bypassClickHandlers(modalRoot);
-      log("Modal processed — premium options unlocked");
-    });
-  }
-
-  function scanForModal() {
-    const candidates = document.querySelectorAll("div");
-    for (const el of candidates) {
-      if (!isScreenShareSettingsModal(el)) continue;
-
-      // Walk up to the topmost container that still matches
-      let modal = el;
-      while (
-        modal.parentElement &&
-        isScreenShareSettingsModal(modal.parentElement) &&
-        modal.parentElement !== document.body
-      ) {
-        modal = modal.parentElement;
-      }
-
-      processModal(modal);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // MutationObserver
-  // ---------------------------------------------------------------------------
-
-  let scheduled = false;
-  function scheduleScan() {
-    if (scheduled) return;
-    scheduled = true;
-    requestAnimationFrame(() => {
-      scheduled = false;
-      try {
-        scanForModal();
-      } catch (e) {
-        console.error(`[${PLUGIN_ID}] scan failed`, e);
-      }
-    });
-  }
-
-  const observer = new MutationObserver(() => scheduleScan());
+  });
   observer.observe(document.documentElement, { childList: true, subtree: true });
 
-  // Initial pass
-  scheduleScan();
-
   log("Loaded — premium screen-share options will be unlocked");
-})();
+
+  // If the fluxin argument was passed, also patch the store through the
+  // passed-in reference in case `window.fluxin` differs.
+  if (fluxin && fluxin !== window.fluxin) {
+    log("Plugin received fluxin context arg (distinct from window.fluxin)");
+  }
+})(typeof fluxin !== "undefined" ? fluxin : window.fluxin);
