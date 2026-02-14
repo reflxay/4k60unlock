@@ -1,8 +1,7 @@
-// Fluxin remote plugin: Unlock 1080p+/60fps for non-premium users AND auto-pick 4K + 60fps.
+// Fluxin remote plugin: Unlock 1080p+/60fps for non-premium users.
 //
-// This is a superset of fluxin-auto-4k60.  It removes the premium gate from the
-// Screen Share Settings modal so that all resolution / frame-rate options are
-// selectable regardless of subscription status, then auto-selects 4K + 60 fps.
+// Removes the premium gate from the Screen Share Settings modal so that all
+// resolution / frame-rate options are selectable regardless of subscription status.
 //
 // Install via Fluxin Plugins UI by hosting this file somewhere reachable over HTTP(S).
 // Example local-dev server is provided in ./server.js
@@ -32,15 +31,7 @@
     return null;
   }
 
-  function findButtonContainingLabel(root, label) {
-    // Some buttons have an icon + text.  textContent will include both, so we
-    // look for buttons whose textContent *contains* the label.
-    const buttons = root.querySelectorAll("button");
-    for (const btn of buttons) {
-      if (textOf(btn).includes(label)) return btn;
-    }
-    return null;
-  }
+
 
   // ---------------------------------------------------------------------------
   // React fiber helpers — used to reach into React component state / handlers
@@ -387,25 +378,7 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Phase 2 — Auto-select 4K + 60fps (from original plugin)
-  // ---------------------------------------------------------------------------
 
-  function tryAutoSelect(modalRoot) {
-    const fourK = findButtonContainingLabel(modalRoot, "4K");
-    const sixty = findButtonContainingLabel(modalRoot, "60 fps") || findButtonContainingLabel(modalRoot, "60fps");
-
-    if (fourK) {
-      fourK.click();
-    }
-    if (sixty) {
-      sixty.click();
-    }
-
-    if (fourK || sixty) {
-      log("Auto-selected 4K + 60fps");
-    }
-  }
 
   // ---------------------------------------------------------------------------
   // Modal detection & orchestration
@@ -433,12 +406,6 @@
     // (wait a tick for React to finish rendering after our DOM mutations)
     setTimeout(() => {
       bypassClickHandlers(modalRoot);
-
-      // Phase 2: auto-select 4K + 60fps
-      // (another tick to let React process state updates from Phase 1b)
-      setTimeout(() => {
-        tryAutoSelect(modalRoot);
-      }, 50);
     }, 50);
 
     processed.add(modalRoot);
@@ -487,5 +454,5 @@
   // Initial pass (for cases where the modal is already open).
   scheduleScan();
 
-  log("Loaded — premium screen-share options will be unlocked");
+  log("Loaded — premium screen-share options will be unlocked (unlock only, no auto-select)");
 })();
